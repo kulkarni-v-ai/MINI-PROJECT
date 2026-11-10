@@ -1,0 +1,8 @@
+LIBRARY libcrypto-3-x64.dll
+EXPORTS
+    EVP_MD_CTX_new
+    EVP_sha256
+    EVP_DigestInit_ex
+    EVP_DigestUpdate
+    EVP_DigestFinal_ex
+    EVP_MD_CTX_free

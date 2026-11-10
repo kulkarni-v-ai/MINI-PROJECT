@@ -1,0 +1,28 @@
+{
+  "coordinator": {
+    "address": "127.0.0.1",
+    "port": 5000
+  },
+  "http_port": 8080,
+  "auth_token": "rfe-demo-token",
+  "require_auth": true,
+  "auto_recover": true,
+  "rs_k": 2,
+  "rs_m": 1,
+  "chunk_size": 65536,
+  "replication_factor": 2,
+  "peers": [
+    { "id": "A", "address": "127.0.0.1", "port": 5001 },
+    { "id": "B", "address": "127.0.0.1", "port": 5002 },
+    { "id": "C", "address": "127.0.0.1", "port": 5003 }
+  ],
+  "heartbeat_interval_ms": 500,
+  "heartbeat_timeout_ms": 1000,
+  "failure_threshold": 2,
+  "paths": {
+    "metadata_dir": "metadata",
+    "storage_dir": "storage",
+    "output_dir": "output",
+    "input_dir": "input"
+  }
+}

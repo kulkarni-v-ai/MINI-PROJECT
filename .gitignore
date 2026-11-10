@@ -1,0 +1,13 @@
+/build/
+/run/
+/input/
+/output/
+/storage/
+/metadata/
+/deploy/metadata/
+/deploy/storage/
+/deploy/output/
+/deploy/run/
+*.user
+*.suo
+.vs/
