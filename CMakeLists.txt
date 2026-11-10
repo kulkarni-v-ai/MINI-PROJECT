@@ -7,6 +7,12 @@
 #   cmake --build build --config Release
 # ============================================================================
 cmake_minimum_required(VERSION 3.16)
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+# Use static CRT (/MT in Release, /MTd in Debug) on Windows MSVC so prebuilt
+# deploy/bin/*.exe binaries run on fresh Windows PCs without VC++ Redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 project(resilient_file_engine CXX)
 
 set(CMAKE_CXX_STANDARD 17)

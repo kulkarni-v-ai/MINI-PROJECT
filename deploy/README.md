@@ -1,6 +1,6 @@
 # Resilient File Engine — Portable Windows Deployment Package
 
-This self-contained package includes precompiled native Windows x64 binaries, bundled OpenSSL 3 runtime, configuration, and helper PowerShell scripts.
+This self-contained package includes statically-linked (`/MT`) native Windows x64 binaries, bundled OpenSSL 3 runtime, configuration, and helper PowerShell scripts. **No Visual Studio, CMake, OpenSSL installer, or VC++ Redistributable is required on a fresh Windows 10/11 PC.**
 
 ## Contents
 

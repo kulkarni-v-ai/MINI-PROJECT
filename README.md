@@ -22,10 +22,11 @@ Every component executes genuinely over real TCP/HTTP sockets, real multi-proces
    - [4.8 MGFRA — Metadata-Guided File Reconstruction Algorithm](#48-mgfra--metadata-guided-file-reconstruction-algorithm)
 4. [Research-Based Comparison](#research-based-comparison)
 5. [Control Plane & Storage Modules](#control-plane--storage-modules)
-6. [How to Download & Build](#how-to-download--build)
+6. [Scratch System Setup, Dependencies & Build](#scratch-system-setup-dependencies--build)
 7. [Automated Verification & Test Suite (`T01`–`T13`)](#automated-verification--test-suite-t01t13)
 8. [How to Run the Live System (Step-by-Step Guide)](#how-to-run-the-live-system-step-by-step-guide)
-   - [Option A: Single-PC Live Demo (3-Peer RS or 5-Peer Full Hybrid Adaptive)](#option-a-single-pc-live-demo)
+   - [Fastest Launch: One-Command Demo (`run_demo.ps1` / `run_demo.sh`)](#fastest-launch-one-command-demo)
+   - [Option A: Manual Single-PC Multi-Terminal Demo](#option-a-manual-single-pc-multi-terminal-demo)
    - [Option B: 4-PC Physical Wi-Fi / LAN Demo](#option-b-4-pc-physical-wi-fi--lan-demo)
 9. [Failure, Corruption & Auto-Recovery Walkthrough](#failure-corruption--auto-recovery-walkthrough)
 10. [Configuration & HTTP REST API Reference](#configuration--http-rest-api-reference)
@@ -348,24 +349,48 @@ COLLECT VERIFIED SHARDS (Directly from >= k Peers per Stripe via TCP GET_CHUNK)
 
 ---
 
-## How to Download & Build
+## Scratch System Setup, Dependencies & Build
 
-### Option 1: Clone Repository & Build from Source
+Choose the path matching your machine:
 
-```bash
-git clone https://github.com/kulkarni-v-ai/MINI-PROJECT.git
-cd MINI-PROJECT
-```
+### Path A — Fresh Windows 10 / 11 PC with Zero Pre-Installed Tools (Portable Run)
 
-#### Windows 10 / 11 (x64)
-- **Prerequisites:** Visual Studio 2022 (or Build Tools 2022) with *Desktop development with C++* and CMake $\ge$ 3.16. OpenSSL 3 headers, import library, and runtime DLL are bundled under [`third_party/openssl/`](third_party/openssl/).
+If you just want to **run the full system immediately without installing Visual Studio, CMake, or OpenSSL**:
+1. Download the repository ZIP from GitHub (click **Code $\rightarrow$ Download ZIP** and extract) **or** `git clone https://github.com/kulkarni-v-ai/MINI-PROJECT.git`.
+2. Prebuilt standalone x64 binaries inside [`deploy/bin/`](deploy/bin/) (`controller.exe`, `peer.exe`, `rfe.exe`) are compiled with a **static MSVC C/C++ runtime (`/MT`)** and ship with the bundled OpenSSL 3 runtime (`libcrypto-3-x64.dll`), so **zero VC++ Redistributable or external SDK installations are required** on Windows 10/11.
+3. Launch immediately using [`run_demo.ps1`](run_demo.ps1) (see Section 8 below).
+
+---
+
+### Path B — Fresh Windows 10 / 11 PC Building from Source
+
+Install the build prerequisites on a brand-new Windows PC using `winget` (Windows Package Manager, built into Windows 10/11):
 
 ```powershell
+# 1. Install Git (to clone repository)
+winget install -e --id Git.Git
+
+# 2. Install CMake >= 3.16
+winget install -e --id Kitware.CMake
+
+# 3. Install Visual Studio 2022 Build Tools with C++ (MSVC v143 + Windows 10/11 SDK)
+winget install -e --id Microsoft.VisualStudio.2022.BuildTools `
+  --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+> **Note:** **OpenSSL 3 is already bundled** in [`third_party/openssl/`](third_party/openssl/) (headers, import `libcrypto.lib`, and `libcrypto-3-x64.dll`), so no external OpenSSL download is needed on Windows.
+
+Clone and build (open a fresh PowerShell terminal after installing):
+
+```powershell
+git clone https://github.com/kulkarni-v-ai/MINI-PROJECT.git
+cd MINI-PROJECT
+
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --parallel
 ```
 
-> **Tip:** If `cmake` is not on your global `PATH`, use Visual Studio Build Tools' CMake directly:
+> **Tip:** If `cmake` is not on your global `PATH`, invoke Visual Studio's bundled CMake directly:
 > ```powershell
 > $cmake = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 > & $cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -373,21 +398,41 @@ cmake --build build --config Release --parallel
 > ```
 
 Generated executables in `build\Release\`:
-- `controller.exe` — Central Coordination Server, HTTP Web Console & test suite runner
+- `controller.exe` — Central Coordination Server, HTTP PowerShell Web Monitor & test suite runner
 - `peer.exe` — Independent storage peer daemon
 - `rfe.exe` — Client / Operator CLI
 - `libcrypto-3-x64.dll` — OpenSSL 3 crypto runtime (copied automatically next to binaries)
 
-#### Linux / macOS
+---
+
+### Path C — Fresh Linux / WSL2 / macOS System
+
+Install compiler, CMake, Git, and OpenSSL development headers:
+
+- **Ubuntu / Debian / WSL2:**
+  ```bash
+  sudo apt update && sudo apt install -y git build-essential cmake libssl-dev
+  ```
+- **Fedora / RHEL / Rocky Linux:**
+  ```bash
+  sudo dnf install -y git gcc-c++ cmake openssl-devel
+  ```
+- **macOS (Homebrew):**
+  ```bash
+  xcode-select --install
+  brew install git cmake openssl@3
+  ```
+
+Clone & build:
+
 ```bash
-# Ubuntu/Debian: sudo apt install build-essential cmake libssl-dev
+git clone https://github.com/kulkarni-v-ai/MINI-PROJECT.git
+cd MINI-PROJECT
 cmake -S . -B build
 cmake --build build -j
 ```
 
-### Option 2: Run Portable Prebuilt Windows Binaries (`deploy/`)
-
-The repository includes a ready-to-run standalone Windows x64 package in [`deploy/`](deploy/) (`deploy\bin\controller.exe`, `peer.exe`, `rfe.exe`, `libcrypto-3-x64.dll`, config, and helper scripts). You can copy the `deploy\` folder directly to demo laptops without installing a compiler.
+*(On macOS with Homebrew OpenSSL, pass `-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)` to `cmake -S . -B build` if needed.)*
 
 ---
 
@@ -419,7 +464,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test_gate2_cli.ps1
 
 ## How to Run the Live System (Step-by-Step Guide)
 
-### Option A: Single-PC Live Demo
+### Fastest Launch: One-Command Demo
+
+- **Windows (works with either compiled `build\Release\` OR zero-install `deploy\bin\`):**
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\run_demo.ps1 -Reset
+  ```
+  *Starts Coordinator (`:5000` / Web Monitor `:8080`) + 4 independent peers (`PEER_A..PEER_D`, use `-Peers 3` for RS-only or `-Peers 5` for full failover) and opens **`http://127.0.0.1:8080/`**.*
+
+- **Linux / macOS:**
+  ```bash
+  chmod +x ./run_demo.sh
+  ./run_demo.sh 4
+  ```
+  *Then open **`http://127.0.0.1:8080/`** in your browser.*
+
+---
+
+### Option A: Manual Single-PC Multi-Terminal Demo
 
 Run inside the repository root (using `.\build\Release\...`, or inside `deploy\` using `.\bin\...`):
 
