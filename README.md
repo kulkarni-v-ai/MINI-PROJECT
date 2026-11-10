@@ -423,12 +423,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test_gate2_cli.ps1
 
 Run inside the repository root (using `.\build\Release\...`, or inside `deploy\` using `.\bin\...`):
 
-1. **Terminal 1 — Start Coordinator Server (TCP `:5000` + HTTP Web Console `:8080`)**
+1. **Terminal 1 — Start Coordinator Server (TCP `:5000` + PowerShell/CMD HTTP Live Visualizer `:8080`)**
    ```powershell
    .\build\Release\controller.exe reset
    .\build\Release\controller.exe coordinator 5000 0.0.0.0 8080
    ```
-   Open **`http://127.0.0.1:8080/`** in your browser to monitor live peers, shard maps, **`ARMA REPL`** badges, and real-time audit events (default auth token: `rfe-demo-token`).
+   Open **`http://127.0.0.1:8080/`** in your browser to launch the **PowerShell / CMD-Styled Live Monitor** (default auth token: `rfe-demo-token`, with a **PowerShell Blue / CMD Black** theme switch). Upload any file or click **Visualize Internals** to watch in real time:
+   - The **8-stage End-to-End File Flow**,
+   - **DACA chunk byte offsets & zero-padding**,
+   - **GF(256) Cauchy Parity Matrix & live peer hex/ASCII byte proof**,
+   - **Interactive Peer-Drop / Live Peer-Outage RS Recovery math**, and
+   - The **HRERA 9-Step Recovery Flowchart** & live Peer Chassis Rack.
 
 2. **Terminals 2, 3, 4 (+ Optional Peers 4 & 5 for ARMA Selective Hot Replicas)**
    - **3-Peer `RS(3,2)` Mode ($1.5\times$ minimal storage overhead):**
@@ -543,12 +548,13 @@ See [`GATE2_WINDOWS_DEPLOYMENT.md`](GATE2_WINDOWS_DEPLOYMENT.md) for full multi-
 
 | Endpoint | Auth | Description |
 |---|---|---|
-| `GET /` | Public | Live Cluster Web Console (file upload, peer heartbeat table, shard health & **`ARMA REPL`** map, audit log) |
+| `GET /` | Public | PowerShell / CMD Live Cluster Monitor (8-stage pipeline, DACA chunk map, GF(256) parity/recovery proof, peer chassis rack & HRERA 9-step flowchart) |
 | `POST /api/auth` | JSON `{"token": "..."}` | Issues CSPRNG Bearer `session_token` |
 | `POST /api/upload` | `Authorization: Bearer <tok>` | Raw binary (`X-Filename`) or `multipart/form-data` -> DACA -> SHA-256 -> RS -> PASPA -> ARMA |
 | `GET /api/status` | Public read | Cluster health, peer counts, RS/ARMA policy, active sessions |
 | `GET /api/peers` | Public read | Live peer registry with workloads and heartbeat ages |
 | `GET /api/files` / `GET /api/files/<id>` | Public read | Catalog index and per-stripe shard health map |
+| `GET /api/inspect/<id>` | Public (`?probe=1` requires Auth) | DACA tier/offset breakdown, GF(256) encoding matrix, live peer TCP `GET_CHUNK` probe (`?probe=1`), parity verification & live C++ RS reconstruction proof |
 | `GET /api/events` | Public read | Cluster integrity, placement & recovery audit trail |
 | `POST /api/repair/<id>` | `Authorization: Bearer <tok>` | Synchronous 9-step HRERA recovery trigger |
 | `GET /api/download/<id>` | `Authorization` or `?token=` | Downloads safety copy from Coordinator central staging |

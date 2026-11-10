@@ -1583,8 +1583,49 @@ public:
                 return {false, "HTTP GET /api/download verification failed"};
             }
 
+            // 8. Visual Inspector API: probe=1 requires auth, verifies GF(256) parity on live peers, and proves live recovery when peer is down
+            {
+                auto unauth_insp = http_call("GET", "/api/inspect/" + fid + "?stripe=0&probe=1", "", {});
+                if (unauth_insp.code != 401) {
+                    cleanup();
+                    return {false, "expected 401 on unauthenticated /api/inspect?probe=1"};
+                }
+                auto insp1 = http_call("GET", "/api/inspect/" + fid + "?stripe=0&probe=1",
+                                       "Authorization: Bearer " + sess_tok + "\r\n", {});
+                if (insp1.code != 200) {
+                    cleanup();
+                    return {false, "GET /api/inspect?probe=1 failed"};
+                }
+                auto ij1 = json::Json::parse(insp1.body);
+                if (!ij1["parity_check"]["checked"].as_bool() || !ij1["parity_check"]["verified"].as_bool()) {
+                    cleanup();
+                    return {false, "/api/inspect did not verify live GF(256) parity across cluster peers"};
+                }
+
+                // Kill one peer and confirm /api/inspect performs live C++ RS reconstruction from surviving shards
+                {
+                    std::string err;
+                    proc::terminate_peer(pspecs[1].pid, err);
+                    pspecs[1].pid = 0;
+                }
+                auto dl2 = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                while (coord.registry().get_online_peers().size() > 2 &&
+                       std::chrono::steady_clock::now() < dl2) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                }
+                auto insp2 = http_call("GET", "/api/inspect/" + fid + "?stripe=0&probe=1",
+                                       "Authorization: Bearer " + sess_tok + "\r\n", {});
+                auto ij2 = json::Json::parse(insp2.body);
+                if (!ij2["inspected_stripe"].contains("live_recovery_proof") ||
+                    !ij2["inspected_stripe"]["live_recovery_proof"]["performed"].as_bool() ||
+                    !ij2["inspected_stripe"]["live_recovery_proof"]["recovered"][0]["sha256_match"].as_bool()) {
+                    cleanup();
+                    return {false, "/api/inspect did not produce verified live_recovery_proof when peer went offline"};
+                }
+            }
+
             cleanup();
-            return {true, "HTTP upload API, Web Console, Bearer auth & cross-protocol peer download verified"};
+            return {true, "HTTP upload API, PowerShell Monitor, /api/inspect RS proof & cross-protocol download verified"};
         };
 
         auto t13_hybrid_algorithms = [&]() -> Result {

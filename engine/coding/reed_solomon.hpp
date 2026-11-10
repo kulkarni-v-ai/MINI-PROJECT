@@ -24,6 +24,7 @@ public:
     size_t data_shards() const { return k_; }
     size_t parity_shards() const { return m_; }
     size_t total_shards() const { return n_; }
+    const std::vector<uint8_t>& encoding_matrix() const { return matrix_; }
 
     // Encode K data shards into M parity shards.
     // Each data shard and parity shard must have length `shard_len`.
