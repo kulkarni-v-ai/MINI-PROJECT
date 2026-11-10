@@ -100,6 +100,10 @@ public:
             auto_recover_ = config_["auto_recover"].as_bool();
         if (config_.contains("require_auth") && config_["require_auth"].is_bool())
             require_auth_ = config_["require_auth"].as_bool();
+        if (config_.contains("adaptive_replicas") && config_["adaptive_replicas"].is_bool())
+            adaptive_replicas_ = config_["adaptive_replicas"].as_bool();
+        if (config_.contains("hot_replica_count"))
+            hot_replica_count_ = static_cast<size_t>(config_["hot_replica_count"].as_int());
     }
 
     // ---- Gate-2: Coordinator Service & Peer Registry commands -----------------
@@ -110,7 +114,8 @@ public:
 
         CoordinatorService coordinator(addr, port, hb_interval_, hb_timeout_, hb_threshold_,
                                        rs_k_, rs_m_, actual_http, auth_token_,
-                                       auto_recover_, require_auth_);
+                                       auto_recover_, require_auth_,
+                                       adaptive_replicas_, hot_replica_count_);
         if (!coordinator.start()) return 1;
 
         std::cout << "[Coordinator] Service listening. Press Ctrl+C to terminate.\n";
@@ -1582,12 +1587,265 @@ public:
             return {true, "HTTP upload API, Web Console, Bearer auth & cross-protocol peer download verified"};
         };
 
+        auto t13_hybrid_algorithms = [&]() -> Result {
+            quiet([&] { return cmd_sys_stop(); });
+            quiet([&] { return cmd_reset(); });
+
+            // 1. Verify DACA file-size + resource-constraint adaptive sizing
+            {
+                AdaptiveChunker daca(AdaptivePolicy(), 4, 2);
+                if (daca.calculate_shard_size(512ULL * 1024ULL) != 65536ULL)
+                    return {false, "DACA <=1MB tier expected 64KB"};
+                if (daca.calculate_shard_size(2ULL * 1024ULL * 1024ULL) != 262144ULL)
+                    return {false, "DACA 1-10MB tier expected 256KB"};
+                if (daca.calculate_shard_size(2ULL * 1024ULL * 1024ULL, 64ULL * 1024ULL) != 16384ULL)
+                    return {false, "DACA resource-constrained adaptation failed to step down to 16KB"};
+            }
+
+            // 2. Verify Systematic GF(256) RS(6,4) double-loss recovery + MGFRA >= 1000-stripe ordering
+            {
+                std::error_code ec;
+                fs::create_directories("output/t13_rs64_shards", ec);
+                std::vector<uint8_t> buf(25000);
+                for (size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<uint8_t>((i * 97 + 31) & 0xFF);
+                const std::string rs64_in = "output/t13_rs64_in.bin";
+                {
+                    std::ofstream o(rs64_in, std::ios::binary | std::ios::trunc);
+                    o.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+                }
+                AdaptivePolicy p64;
+                p64.size_under_1mb = 1024;
+                AdaptiveChunker ch64(p64, 4, 2);
+                uint64_t sh_sz = 0;
+                auto sh64 = ch64.encode_file("F64", rs64_in, "output/t13_rs64_shards", sh_sz);
+
+                // Drop 2 shards per stripe (D1 and D3), reconstruct using D0 + D2 + P0 + P1
+                std::string st64 = "output/t13_rs64_surv";
+                fs::create_directories(st64, ec);
+                for (const auto& s : sh64) {
+                    if (s.chunk_id.find("-D1") == std::string::npos &&
+                        s.chunk_id.find("-D3") == std::string::npos) {
+                        fs::copy_file("output/t13_rs64_shards/" + s.chunk_id + ".chunk",
+                                      st64 + "/" + s.chunk_id + ".chunk",
+                                      fs::copy_options::overwrite_existing, ec);
+                    }
+                }
+                std::string rs64_out = "output/t13_rs64_out.bin";
+                std::string err;
+                if (!ch64.reconstruct_file("F64", buf.size(), sh64, st64, rs64_out, err) ||
+                    slurp(rs64_in) != slurp(rs64_out)) {
+                    return {false, "RS(6,4) double-shard recovery failed: " + err};
+                }
+
+                // MGFRA numeric sequence ordering check across >1000 stripes (S1000..S1004 vs S200)
+                // Synthesize 1005 tiny 2-shard stripes safely by encoding a 16080-byte file with 8B shards
+                AdaptivePolicy p_many;
+                p_many.min_size_bytes = 8;
+                p_many.size_under_1mb = 8;
+                AdaptiveChunker ch_many(p_many, 2, 1);
+                std::vector<uint8_t> many_buf(16080); // 1005 stripes * 2 * 8B = 16080B -> S000 .. S1004
+                for (size_t i = 0; i < many_buf.size(); ++i) many_buf[i] = static_cast<uint8_t>((i * 19 + 5) & 0xFF);
+                const std::string many_in = "output/t13_many_in.bin";
+                {
+                    std::ofstream o(many_in, std::ios::binary | std::ios::trunc);
+                    o.write(reinterpret_cast<const char*>(many_buf.data()), static_cast<std::streamsize>(many_buf.size()));
+                }
+                fs::create_directories("output/t13_many_shards", ec);
+                uint64_t many_sh_sz = 0;
+                auto sh_many = ch_many.encode_file("FM", many_in, "output/t13_many_shards", many_sh_sz);
+                // Reverse manifest order to verify MGFRA sorts strictly by numeric sequence (not stripe_id string)
+                std::reverse(sh_many.begin(), sh_many.end());
+                std::string many_out = "output/t13_many_out.bin";
+                if (!ch_many.reconstruct_file("FM", many_buf.size(), sh_many, "output/t13_many_shards", many_out, err) ||
+                    slurp(many_in) != slurp(many_out)) {
+                    return {false, "MGFRA >1000-stripe numeric sequence ordering check failed: " + err};
+                }
+                fs::remove_all("output/t13_rs64_shards", ec);
+                fs::remove_all("output/t13_rs64_surv", ec);
+                fs::remove_all("output/t13_many_shards", ec);
+            }
+
+            // 3. Full live cluster PASPA + ARMA + HPFD + HRERA (both Replica Copy & RS Decode)
+            const std::string exe = proc::find_peer_exe();
+            if (exe.empty()) return {false, "peer binary not found"};
+
+            const std::string secret = "t13-hybrid-secret";
+            const uint16_t tcp_port = 5670;
+            CoordinatorService coord("127.0.0.1", tcp_port, 200, 500, 2, 2, 1, 0, secret, true, true, true, 1);
+            if (!coord.start()) return {false, "failed to start Coordinator on 5670"};
+
+            struct PeerSpec { std::string id; uint16_t port; long pid = 0; };
+            std::vector<PeerSpec> pspecs = {
+                {"H13_A", 5671, 0}, {"H13_B", 5672, 0}, {"H13_C", 5673, 0}, {"H13_D", 5674, 0}, {"H13_E", 5675, 0}
+            };
+            auto cleanup = [&]() {
+                for (const auto& ps : pspecs) {
+                    if (ps.pid > 0) { std::string e; proc::terminate_peer(ps.pid, e); }
+                }
+                coord.stop();
+            };
+
+            for (auto& ps : pspecs) {
+                std::string err;
+                if (!proc::start_peer(exe, ps.id, "127.0.0.1", ps.port, ps.pid, err, "127.0.0.1", tcp_port)) {
+                    cleanup();
+                    return {false, "failed to start peer " + ps.id + ": " + err};
+                }
+            }
+
+            auto wait_online = [&](size_t target, int ms) -> bool {
+                auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+                while (std::chrono::steady_clock::now() < dl) {
+                    if (coord.registry().get_online_peers().size() == target) return true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                }
+                return false;
+            };
+            if (!wait_online(5, 5000)) { cleanup(); return {false, "expected 5 online peers"}; }
+
+            // Single 120 KB upload fits in 1 stripe (D0=64KB, D1=56KB, P0=64KB -> 3 primary + 1 ARMA hot replica on D0)
+            std::vector<uint8_t> payload(120000);
+            for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<uint8_t>((i * 53 + 11) & 0xFF);
+            const std::string expected_sha = ChunkManager::sha256_of_bytes(payload);
+
+            std::string sess_tok;
+            {
+                TCPClient tc(2000, 2000);
+                tc.connect_to("127.0.0.1", tcp_port);
+                json::Json req = json::Json::object();
+                req["type"] = proto::SESSION_AUTH;
+                req["client_id"] = "t13-client";
+                req["auth_token"] = secret;
+                json::Json resp;
+                std::vector<uint8_t> pl;
+                if (tc.request(req, {}, resp, pl) != proto::RecvStatus::OK ||
+                    resp["type"].as_string() != proto::SESSION_AUTH_ACK) {
+                    cleanup(); return {false, "SESSION_AUTH failed"};
+                }
+                sess_tok = resp["session_token"].as_string();
+            }
+
+            std::string fid;
+            {
+                TCPClient tc(2000, 15000);
+                tc.connect_to("127.0.0.1", tcp_port);
+                json::Json up = json::Json::object();
+                up["type"] = "UPLOAD_FILE";
+                up["session_token"] = sess_tok;
+                up["filename"] = "t13_hybrid.bin";
+                json::Json uresp;
+                std::vector<uint8_t> pl;
+                if (tc.request(up, payload, uresp, pl) != proto::RecvStatus::OK ||
+                    uresp["status_str"].as_string() != "AVAILABLE") {
+                    cleanup(); return {false, "hybrid upload failed"};
+                }
+                fid = uresp["file_id"].as_string();
+            }
+
+            // Check ARMA placed selective hot replica for S000-D0 across 2 distinct peers
+            FileRecord rec;
+            coord.catalog().get_file(fid, rec);
+            if (rec.shards.size() != 3 || rec.shards[0].peers.size() != 2 ||
+                rec.shards[1].peers.size() != 1 || rec.shards[2].peers.size() != 1) {
+                cleanup();
+                return {false, "expected ARMA placement S000-D0=2 peers, D1=1, P0=1"};
+            }
+            if (!events_contain("DACA_CHUNKED")) {
+                cleanup(); return {false, "missing DACA_CHUNKED audit event"};
+            }
+
+            const std::string d0_primary = rec.shards[0].peers[0];
+            const std::string d0_replica = rec.shards[0].peers[1];
+            const std::string d1_sole    = rec.shards[1].peers[0];
+
+            // HRERA Path A: Kill primary holder of S000-D0 (has hot replica on d0_replica, spare 5th peer exists)
+            size_t killed_p0_idx = 0;
+            for (size_t i = 0; i < pspecs.size(); ++i) {
+                if (pspecs[i].id == d0_primary) {
+                    std::string e;
+                    proc::terminate_peer(pspecs[i].pid, e);
+                    pspecs[i].pid = 0;
+                    killed_p0_idx = i;
+                    break;
+                }
+            }
+
+            // Wait for HPFD -> HRERA Replica Copy Recovery (`REPAIR_REPLICA_OK`)
+            {
+                auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+                while (std::chrono::steady_clock::now() < dl && !events_contain("REPAIR_REPLICA_OK")) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (!events_contain("REPAIR_REPLICA_OK")) {
+                    cleanup();
+                    return {false, "HRERA did not trigger REPAIR_REPLICA_OK on replicated shard peer loss"};
+                }
+                if (events_contain("REPAIR_RS_OK")) {
+                    cleanup();
+                    return {false, "HRERA needlessly used RS decode when alternate replica existed"};
+                }
+                coord.catalog().get_file(fid, rec);
+                if (rec.shards[0].peers.size() != 2 ||
+                    std::find(rec.shards[0].peers.begin(), rec.shards[0].peers.end(), d0_replica) == rec.shards[0].peers.end()) {
+                    cleanup();
+                    return {false, "S000-D0 replica holder list mismatch after COPY_SHARD"};
+                }
+            }
+
+            // Restart the terminated peer (now free healthy 5th peer), then kill sole holder of S000-D1!
+            {
+                std::string err;
+                if (!proc::start_peer(exe, pspecs[killed_p0_idx].id, "127.0.0.1",
+                                      pspecs[killed_p0_idx].port, pspecs[killed_p0_idx].pid,
+                                      err, "127.0.0.1", tcp_port)) {
+                    cleanup();
+                    return {false, "failed to restart spare peer: " + err};
+                }
+                if (!wait_online(5, 4000)) { cleanup(); return {false, "spare peer did not come back ONLINE"}; }
+            }
+
+            for (size_t i = 0; i < pspecs.size(); ++i) {
+                if (pspecs[i].id == d1_sole) {
+                    std::string e;
+                    proc::terminate_peer(pspecs[i].pid, e);
+                    pspecs[i].pid = 0;
+                    break;
+                }
+            }
+
+            // HRERA Path B: No replica exists for S000-D1 -> escalates to P2P RS Decode (`REPAIR_RS_OK`)!
+            {
+                auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+                while (std::chrono::steady_clock::now() < dl && !events_contain("REPAIR_RS_OK")) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (!events_contain("REPAIR_RS_OK")) {
+                    cleanup();
+                    return {false, "HRERA did not escalate to REPAIR_RS_OK when unreplicated shard peer failed"};
+                }
+            }
+
+            // Final peer-to-client MGFRA download verification
+            {
+                ClientDownload cdl("127.0.0.1", tcp_port, "output/t13_dl", sess_tok, secret);
+                DownloadResult dr = cdl.download(fid, DownloadSource::PEERS, nullptr);
+                if (!dr.success || dr.actual_sha256 != expected_sha) {
+                    cleanup();
+                    return {false, "T13 final MGFRA peer download failed: " + dr.message};
+                }
+            }
+
+            cleanup();
+            return {true, "DACA, RS(6,4), MGFRA 1005-stripe order, PASPA, ARMA & HRERA (Replica+RS) verified"};
+        };
+
         struct Test { const char* name; std::function<Result()> run; };
         const std::vector<Test> tests = {
             {"T01", t01}, {"T02", t02}, {"T03", t03}, {"T04", t04},
             {"T05", t05}, {"T06", t06}, {"T07", t07}, {"T08_M2", t08},
             {"T09_RS", t09_rs}, {"T10_GATE2", t10_gate2_e2e},
-            {"T11_RECOVERY_FLOW", t11_recovery_flow}, {"T12_AUTH_HTTP", t12_auth_http}};
+            {"T11_RECOVERY_FLOW", t11_recovery_flow}, {"T12_AUTH_HTTP", t12_auth_http},
+            {"T13_HYBRID_ALGORITHMS", t13_hybrid_algorithms}};
 
         std::cout << "================ Resilient File Engine Test Suite ================\n";
         int pass = 0, failn = 0;
@@ -1624,6 +1882,8 @@ private:
     std::string auth_token_ = "rfe-demo-token";
     bool auto_recover_ = true;
     bool require_auth_ = true;
+    bool adaptive_replicas_ = true;
+    size_t hot_replica_count_ = 1;
 
     std::string staging_dir() const { return "output/staging"; }
     std::string output_dir() const { return "output"; }
@@ -1638,7 +1898,8 @@ static void usage() {
         "  sys start|stop|status        start / stop / list the 3 peer processes\n"
         "  fail <A|B|C|random>          simulate a peer process failure\n"
         "  demo [file]                  full Gate-1 demonstration (default: input/sample_file.bin)\n"
-        "  test [T01 .. T12_AUTH_HTTP]  run automated test suite\n"
+        "  test [T01 .. T13_HYBRID_ALGORITHMS]\n"
+        "                               run automated test suite\n"
         "  chunk <file>                 E1: chunk file + SHA-256 + metadata\n"
         "  distribute                   E3: round-robin + replication to peers\n"
         "  ping                         E2: REGISTER handshake with all peers\n"

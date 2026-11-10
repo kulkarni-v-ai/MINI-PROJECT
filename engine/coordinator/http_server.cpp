@@ -192,7 +192,7 @@ const char* DASHBOARD_HTML = R"HTML(<!DOCTYPE html>
 <header>
   <div>
     <h1>Resilient Multi-Peer File Storage &amp; Recovery</h1>
-    <div class="sub">Central Coordination Server &bull; Systematic RS Erasure Coding &bull; SHA-256 Integrity &bull; P2P Durability Repair</div>
+    <div class="sub">Central Coordination Server &bull; DACA &bull; RS Erasure Coding &bull; PASPA &bull; ARMA &bull; HPFD &bull; HRERA &bull; MGFRA</div>
   </div>
   <div class="row">
     <input id="tok" type="password" placeholder="Cluster Auth Token" value="rfe-demo-token" style="width:170px">
@@ -274,7 +274,8 @@ async function inspectFile(fid) {
   for (const s of (f.shards || [])) {
     const st = s.status || 'HEALTHY';
     const peers = (s.peers || []).join(',') || 'none';
-    html += '<div class="shard"><div><b>'+s.chunk_id+'</b> <span class="badge '+st+'">'+st+'</span></div><div class="sub">Peer: '+peers+' &bull; '+s.shard_type+'</div></div>';
+    const replTag = (s.peers || []).length > 1 ? ' <span class="badge STORED">ARMA REPL</span>' : '';
+    html += '<div class="shard"><div><b>'+s.chunk_id+'</b> <span class="badge '+st+'">'+st+'</span>'+replTag+'</div><div class="sub">Peer: '+peers+' &bull; '+s.shard_type+'</div></div>';
   }
   html += '</div>';
   document.getElementById('manifestBox').innerHTML = html;
@@ -577,6 +578,8 @@ void HttpServer::handle_client(socket_t client_fd) {
         j["files_total"] = static_cast<long long>(files.size());
         j["rs_k"] = static_cast<long long>(coord_.rs_k());
         j["rs_m"] = static_cast<long long>(coord_.rs_m());
+        j["adaptive_replicas"] = coord_.adaptive_replicas();
+        j["hot_replica_count"] = static_cast<long long>(coord_.hot_replica_count());
         j["active_sessions"] = static_cast<long long>(coord_.sessions().active_session_count());
         send_json(client_fd, 200, "OK", j);
         sock_close(client_fd);

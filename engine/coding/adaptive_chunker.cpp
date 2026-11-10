@@ -4,10 +4,12 @@
 #include "adaptive_chunker.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -18,18 +20,45 @@ namespace fs = std::filesystem;
 AdaptiveChunker::AdaptiveChunker(AdaptivePolicy policy, size_t data_shards, size_t parity_shards)
     : policy_(policy), k_(data_shards), m_(parity_shards), rs_(data_shards, parity_shards) {}
 
-uint64_t AdaptiveChunker::calculate_shard_size(uint64_t file_size) const {
-    if (file_size <= policy_.threshold_1mb) return policy_.size_under_1mb;
-    if (file_size <= policy_.threshold_10mb) return policy_.size_1_to_10mb;
-    if (file_size <= policy_.threshold_100mb) return policy_.size_10_to_100mb;
-    if (file_size <= policy_.threshold_1gb) return policy_.size_100mb_to_1gb;
-    return policy_.size_above_1gb;
+uint64_t AdaptiveChunker::calculate_shard_size(uint64_t file_size,
+                                               uint64_t min_peer_avail_bytes) const {
+    uint64_t chosen = policy_.size_above_1gb;
+    if (file_size <= policy_.threshold_1mb)        chosen = policy_.size_under_1mb;
+    else if (file_size <= policy_.threshold_10mb)  chosen = policy_.size_1_to_10mb;
+    else if (file_size <= policy_.threshold_100mb) chosen = policy_.size_10_to_100mb;
+    else if (file_size <= policy_.threshold_1gb)   chosen = policy_.size_100mb_to_1gb;
+
+    // DACA resource-awareness: adapt shard boundary downward if tightest peer free storage requires smaller stripes
+    if (min_peer_avail_bytes > 0) {
+        const uint64_t headroom_budget = std::max<uint64_t>(policy_.min_size_bytes, min_peer_avail_bytes / 4ULL);
+        if (chosen > headroom_budget) {
+            const std::array<uint64_t, 7> tiers = {
+                policy_.size_above_1gb,
+                policy_.size_100mb_to_1gb,
+                policy_.size_10_to_100mb,
+                policy_.size_1_to_10mb,
+                policy_.size_under_1mb,
+                16ULL * 1024ULL,
+                policy_.min_size_bytes
+            };
+            uint64_t adapted = policy_.min_size_bytes;
+            for (uint64_t t : tiers) {
+                if (t <= chosen && t <= headroom_budget) {
+                    adapted = t;
+                    break;
+                }
+            }
+            chosen = std::max(policy_.min_size_bytes, adapted);
+        }
+    }
+    return chosen;
 }
 
 std::vector<ShardMeta> AdaptiveChunker::encode_file(const std::string& file_id,
                                                    const std::string& file_path,
                                                    const std::string& staging_dir,
-                                                   uint64_t& chosen_shard_size_out) {
+                                                   uint64_t& chosen_shard_size_out,
+                                                   uint64_t min_peer_avail_bytes) {
     std::ifstream in(file_path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open file for encoding: " + file_path);
 
@@ -39,7 +68,7 @@ std::vector<ShardMeta> AdaptiveChunker::encode_file(const std::string& file_id,
 
     fs::create_directories(staging_dir);
 
-    const uint64_t shard_size = calculate_shard_size(file_size);
+    const uint64_t shard_size = calculate_shard_size(file_size, min_peer_avail_bytes);
     chosen_shard_size_out = shard_size;
 
     std::vector<ShardMeta> all_shards;
@@ -148,13 +177,40 @@ bool AdaptiveChunker::reconstruct_file(const std::string& file_id,
         return false;
     }
 
-    // Group shards by stripe
-    std::map<std::string, std::vector<ShardMeta>> stripes;
+    // MGFRA Step 1: Group shards by stripe and order strictly by numeric sequence number
+    // (avoids lexicographical "S1000" < "S200" ordering bug on large multi-stripe files).
+    struct StripeGroup {
+        std::string stripe_id;
+        uint64_t min_seq = std::numeric_limits<uint64_t>::max();
+        std::vector<ShardMeta> shards;
+    };
+    std::map<std::string, size_t> group_index;
+    std::vector<StripeGroup> ordered_stripes;
     for (const auto& sm : manifest_shards) {
-        if (sm.file_id == file_id) {
-            stripes[sm.stripe_id].push_back(sm);
+        if (sm.file_id != file_id) continue;
+        auto it = group_index.find(sm.stripe_id);
+        size_t idx = 0;
+        if (it == group_index.end()) {
+            idx = ordered_stripes.size();
+            group_index[sm.stripe_id] = idx;
+            ordered_stripes.push_back({sm.stripe_id, sm.sequence, {}});
+        } else {
+            idx = it->second;
+            ordered_stripes[idx].min_seq = std::min(ordered_stripes[idx].min_seq, sm.sequence);
         }
+        ordered_stripes[idx].shards.push_back(sm);
     }
+
+    if (ordered_stripes.empty()) {
+        error_out = "no shards matched file_id " + file_id;
+        return false;
+    }
+
+    std::sort(ordered_stripes.begin(), ordered_stripes.end(),
+              [](const StripeGroup& a, const StripeGroup& b) {
+                  if (a.min_seq != b.min_seq) return a.min_seq < b.min_seq;
+                  return a.stripe_id < b.stripe_id;
+              });
 
     fs::path out_p(output_file_path);
     if (out_p.has_parent_path()) {
@@ -169,48 +225,60 @@ bool AdaptiveChunker::reconstruct_file(const std::string& file_id,
 
     uint64_t total_written = 0;
 
-    for (const auto& kv : stripes) {
-        const std::string& stripe_id = kv.first;
-        const auto& stripe_shards = kv.second;
+    for (auto& sg : ordered_stripes) {
+        const std::string& stripe_id = sg.stripe_id;
+        std::sort(sg.shards.begin(), sg.shards.end(), [](const ShardMeta& a, const ShardMeta& b) {
+            return a.sequence < b.sequence;
+        });
 
         const size_t total_n = k_ + m_;
         std::vector<std::vector<uint8_t>> shard_bufs(total_n);
         std::vector<bool> shard_present(total_n, false);
+        std::vector<std::string> expected_hashes(total_n);
         uint64_t shard_len = 0;
         std::vector<uint64_t> orig_lens(k_, 0);
+        std::vector<bool> data_slot_expected(k_, false);
 
-        for (const auto& sm : stripe_shards) {
+        for (const auto& sm : sg.shards) {
             size_t idx = 0;
             if (sm.shard_type == "DATA") {
-                // Parse DX
                 size_t d_pos = sm.chunk_id.rfind("-D");
-                if (d_pos != std::string::npos) {
-                    idx = std::stoul(sm.chunk_id.substr(d_pos + 2));
-                }
-                if (idx < k_) orig_lens[idx] = sm.original_data_length;
+                if (d_pos == std::string::npos) continue;
+                try { idx = std::stoul(sm.chunk_id.substr(d_pos + 2)); } catch (...) { continue; }
+                if (idx >= k_) continue;
+                orig_lens[idx] = sm.original_data_length;
+                data_slot_expected[idx] = true;
             } else {
-                // Parse PX
                 size_t p_pos = sm.chunk_id.rfind("-P");
-                if (p_pos != std::string::npos) {
-                    idx = k_ + std::stoul(sm.chunk_id.substr(p_pos + 2));
-                }
+                if (p_pos == std::string::npos) continue;
+                try { idx = k_ + std::stoul(sm.chunk_id.substr(p_pos + 2)); } catch (...) { continue; }
+                if (idx >= total_n) continue;
             }
-            if (idx >= total_n) continue;
 
             shard_len = sm.size;
+            expected_hashes[idx] = sm.sha256;
             shard_bufs[idx].assign(shard_len, 0);
 
             const std::string path = shards_dir + "/" + sm.chunk_id + ".chunk";
             if (fs::exists(path) && fs::file_size(path) == shard_len) {
                 std::ifstream sh_in(path, std::ios::binary);
                 sh_in.read(reinterpret_cast<char*>(shard_bufs[idx].data()), static_cast<std::streamsize>(shard_len));
-                if (ChunkManager::sha256_of_bytes(shard_bufs[idx]) == sm.sha256) {
+                if (sm.sha256.empty() || ChunkManager::sha256_of_bytes(shard_bufs[idx]) == sm.sha256) {
                     shard_present[idx] = true;
                 }
             }
         }
 
-        // Count available shards
+        // Validate sequence completeness on metadata slots
+        for (size_t d = 0; d < k_; ++d) {
+            if (!data_slot_expected[d]) {
+                error_out = "missing sequence metadata for data slot D" + std::to_string(d) +
+                            " in stripe " + stripe_id;
+                return false;
+            }
+        }
+
+        // Count available verified shards
         size_t available = 0;
         for (bool b : shard_present) if (b) ++available;
 
@@ -220,7 +288,7 @@ bool AdaptiveChunker::reconstruct_file(const std::string& file_id,
             return false;
         }
 
-        // Decode / reconstruct missing shards
+        // Decode / reconstruct missing shards using RS(k+m, k)
         std::vector<uint8_t*> shard_ptrs(total_n);
         for (size_t i = 0; i < total_n; ++i) shard_ptrs[i] = shard_bufs[i].data();
 
@@ -229,8 +297,14 @@ bool AdaptiveChunker::reconstruct_file(const std::string& file_id,
             return false;
         }
 
-        // Write original data bytes from reconstructed data shards
+        // MGFRA Verification & Ordered Unpadded Sequential Write
         for (size_t d = 0; d < k_; ++d) {
+            if (!expected_hashes[d].empty() &&
+                ChunkManager::sha256_of_bytes(shard_bufs[d]) != expected_hashes[d]) {
+                error_out = "reconstructed data shard SHA-256 verification failed on stripe " +
+                            stripe_id + " slot D" + std::to_string(d);
+                return false;
+            }
             const uint64_t valid_bytes = std::min(orig_lens[d], original_size - total_written);
             if (valid_bytes > 0) {
                 out.write(reinterpret_cast<const char*>(shard_bufs[d].data()), static_cast<std::streamsize>(valid_bytes));

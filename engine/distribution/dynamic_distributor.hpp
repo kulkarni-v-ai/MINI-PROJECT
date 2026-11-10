@@ -1,18 +1,19 @@
 // ============================================================================
-// dynamic_distributor.hpp - Dynamic Peer Selection & Shard Distribution (E3)
+// dynamic_distributor.hpp - PASPA & ARMA Placement / Redundancy Engine (E3)
 //
-// Dynamically selects distinct, healthy, capable peers per RS(3,2) stripe:
-//   - Filter by ONLINE health state
-//   - Filter by available disk capacity
-//   - Filter by transfer workload (concurrent active transfers vs capacity)
-//   - Rotates placement across stripes to avoid hot spots
-//   - Sends real shard bytes over TCP
-//   - Verifies SHA-256 acknowledgements before committing locations
-//   - Retries missing/failed placements onto alternative eligible peers
-//   - Reports AVAILABLE (3/3), DEGRADED (2/3), or shortfall honestly
+// Implements:
+//   - PASPA (Peer-Aware Shard Placement Algorithm):
+//       Weighted suitability scoring across ONLINE peers combining health stability,
+//       available storage headroom, active-transfer load, cumulative balance, and
+//       failure-domain separation (unique peer ID & IP host anti-affinity per stripe).
+//   - ARMA (Adaptive Redundancy Management Algorithm):
+//       Combines RS(k+m, k) systematic erasure shards with selective direct hot
+//       replicas for primary data shards when healthy disjoint spare capacity exists.
+//   - Genuine TCP shard push with SHA-256 verification before committing metadata.
 // ============================================================================
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -21,17 +22,23 @@
 #include "../catalog/catalog_manager.hpp"
 #include "../registry/peer_registry.hpp"
 
+struct ArmaPolicy {
+    bool adaptive_replicas = true;
+    size_t hot_replica_count = 1; // selective hot direct replicas per stripe when disjoint peers exist
+};
+
 class DynamicDistributor {
 public:
     explicit DynamicDistributor(PeerRegistry& registry);
 
-    // Distribute shards to dynamically chosen distinct peers.
-    // Updates shard.peers on successful placement.
+    // Execute PASPA primary placement + ARMA selective direct replication across peers.
+    // Updates shard.peers and shard.status on verified SHA-256 commit.
     FileDistributionStatus distribute_file(const std::string& file_id,
                                           std::vector<ShardMeta>& shards,
                                           const std::string& staging_dir,
                                           std::string& log_out,
-                                          size_t min_k = 2);
+                                          size_t min_k = 2,
+                                          ArmaPolicy arma = ArmaPolicy());
 
 private:
     PeerRegistry& registry_;

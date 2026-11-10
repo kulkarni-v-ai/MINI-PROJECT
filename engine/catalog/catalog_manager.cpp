@@ -439,9 +439,10 @@ std::vector<std::string> CatalogManager::mark_peer_shards_unavailable(const std:
     for (auto& rec : all) {
         if (rec.shards.empty()) continue;
         bool file_changed = false;
+        bool touches_peer = false;
         for (auto& sh : rec.shards) {
             if (std::find(sh.peers.begin(), sh.peers.end(), peer_id) != sh.peers.end()) {
-                // If this shard has no other peer or primary peer went offline, mark UNAVAILABLE
+                touches_peer = true;
                 bool has_other_peer = false;
                 for (const auto& pid : sh.peers) {
                     if (pid != peer_id) { has_other_peer = true; break; }
@@ -455,8 +456,10 @@ std::vector<std::string> CatalogManager::mark_peer_shards_unavailable(const std:
         if (file_changed) {
             rec.status = evaluate_file_status(rec);
             save_file_manifest(rec);
-            affected_files.push_back(rec.file_id);
             any_changed = true;
+        }
+        if (touches_peer) {
+            affected_files.push_back(rec.file_id);
         }
     }
 

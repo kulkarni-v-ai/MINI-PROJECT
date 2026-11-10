@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -28,7 +29,9 @@ CoordinatorService::CoordinatorService(std::string bind_address,
                                        uint16_t http_port,
                                        std::string auth_token,
                                        bool auto_recover,
-                                       bool require_auth)
+                                       bool require_auth,
+                                       bool adaptive_replicas,
+                                       size_t hot_replica_count)
     : bind_address_(std::move(bind_address)),
       port_(port),
       heartbeat_interval_ms_(heartbeat_interval_ms),
@@ -39,6 +42,8 @@ CoordinatorService::CoordinatorService(std::string bind_address,
       http_port_(http_port),
       auto_recover_(auto_recover),
       require_auth_(require_auth),
+      adaptive_replicas_(adaptive_replicas),
+      hot_replica_count_(hot_replica_count),
       sessions_(std::move(auth_token), "metadata", "storage") {}
 
 CoordinatorService::~CoordinatorService() {
@@ -206,17 +211,39 @@ bool CoordinatorService::process_uploaded_file(const std::string& file_id, FileR
     }
 
     std::cout << "[Coordinator] Encoding & distributing " << file_id
-              << " with RS(" << (rs_k_ + rs_m_) << "," << rs_k_ << ")...\n";
+              << " with DACA + RS(" << (rs_k_ + rs_m_) << "," << rs_k_ << ")"
+              << (adaptive_replicas_ ? " + ARMA" : "") << "...\n";
+
+    // DACA: compute minimum available storage among online peers for resource-aware boundary sizing
+    uint64_t min_peer_avail = 0;
+    for (const auto& p : online) {
+        if (p.workload.available_storage_bytes > 0) {
+            if (min_peer_avail == 0 || p.workload.available_storage_bytes < min_peer_avail) {
+                min_peer_avail = p.workload.available_storage_bytes;
+            }
+        }
+    }
 
     AdaptiveChunker chunker(AdaptivePolicy(), rs_k_, rs_m_);
     uint64_t chosen_shard_size = 0;
     const std::string staging_dir = "output/staging/" + file_id;
-    rec_out.shards = chunker.encode_file(file_id, rec_out.central_path, staging_dir, chosen_shard_size);
+    rec_out.shards = chunker.encode_file(
+        file_id, rec_out.central_path, staging_dir, chosen_shard_size, min_peer_avail);
+
+    {
+        json::Json cd = json::Json::object();
+        cd["file_id"] = file_id;
+        cd["shard_size"] = static_cast<long long>(chosen_shard_size);
+        cd["shards_count"] = static_cast<long long>(rec_out.shards.size());
+        cd["min_peer_avail_bytes"] = static_cast<long long>(min_peer_avail);
+        events_.log_event("DACA_CHUNKED", "file adaptively chunked and RS-encoded with SHA-256 digests", cd);
+    }
 
     DynamicDistributor distributor(registry_);
+    ArmaPolicy arma{adaptive_replicas_, hot_replica_count_};
     std::string dist_log;
     FileDistributionStatus new_status =
-        distributor.distribute_file(file_id, rec_out.shards, staging_dir, dist_log, rs_k_);
+        distributor.distribute_file(file_id, rec_out.shards, staging_dir, dist_log, rs_k_, arma);
     std::cout << dist_log;
 
     catalog_.update_shards_and_status(file_id, new_status, rec_out.shards, chosen_shard_size, rs_k_, rs_m_);
@@ -225,13 +252,20 @@ bool CoordinatorService::process_uploaded_file(const std::string& file_id, FileR
     std::error_code ec;
     fs::remove_all(staging_dir, ec);
 
+    size_t hot_replicas = 0;
+    for (const auto& sh : rec_out.shards) {
+        if (sh.peers.size() > 1) ++hot_replicas;
+    }
+
     json::Json d = json::Json::object();
     d["file_id"] = file_id;
     d["filename"] = rec_out.filename;
     d["status"] = file_status_str(rec_out.status);
     d["shard_size"] = static_cast<long long>(chosen_shard_size);
     d["stripes"] = static_cast<long long>(rec_out.stripes_count);
-    events_.log_event("FILE_DISTRIBUTED", "file chunked, RS-encoded, and distributed to peers", d);
+    d["hot_replicas"] = static_cast<long long>(hot_replicas);
+    events_.log_event("FILE_DISTRIBUTED",
+                      "DACA + RS + PASPA + ARMA distribution completed across peers", d);
 
     if (rec_out.status == FileDistributionStatus::DEGRADED ||
         rec_out.status == FileDistributionStatus::RECOVERY_PENDING) {
@@ -760,65 +794,125 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
     const size_t need_k = rec.k > 0 ? rec.k : rs_k_;
     const size_t total_m = rec.m > 0 ? rec.m : rs_m_;
 
-    // Group shards by stripe
-    std::map<std::string, std::vector<size_t>> stripes;
+    // MGFRA / HRERA: Group shards by stripe and sort strictly by numeric min sequence
+    struct StripeGroup {
+        std::string stripe_id;
+        uint64_t min_seq = std::numeric_limits<uint64_t>::max();
+        std::vector<size_t> shard_indices;
+    };
+    std::map<std::string, size_t> stripe_idx_map;
+    std::vector<StripeGroup> ordered_stripes;
     for (size_t i = 0; i < rec.shards.size(); ++i) {
-        stripes[rec.shards[i].stripe_id].push_back(i);
+        auto it = stripe_idx_map.find(rec.shards[i].stripe_id);
+        if (it == stripe_idx_map.end()) {
+            stripe_idx_map[rec.shards[i].stripe_id] = ordered_stripes.size();
+            ordered_stripes.push_back({rec.shards[i].stripe_id, rec.shards[i].sequence, {i}});
+        } else {
+            auto& sg = ordered_stripes[it->second];
+            sg.min_seq = std::min(sg.min_seq, rec.shards[i].sequence);
+            sg.shard_indices.push_back(i);
+        }
     }
+    std::sort(ordered_stripes.begin(), ordered_stripes.end(),
+              [](const StripeGroup& a, const StripeGroup& b) {
+                  if (a.min_seq != b.min_seq) return a.min_seq < b.min_seq;
+                  return a.stripe_id < b.stripe_id;
+              });
 
     std::ostringstream ss;
     bool any_repaired = false;
     bool all_shards_healthy = true;
     bool insufficient_surviving = false;
 
-    for (const auto& kv : stripes) {
-        const auto& shard_indices = kv.second;
+    for (auto& sg : ordered_stripes) {
+        const auto& shard_indices = sg.shard_indices;
+
+        struct ReplicaDegraded {
+            size_t idx = 0;
+            std::vector<std::string> valid_holders;
+            std::vector<std::string> bad_holders;
+        };
 
         std::vector<size_t> missing_indices;
+        std::vector<ReplicaDegraded> replica_heal_list;
         std::vector<size_t> surviving_indices;
         std::vector<std::string> healthy_used_peers;
 
+        auto push_used_unique = [&](const std::string& pid) {
+            if (std::find(healthy_used_peers.begin(), healthy_used_peers.end(), pid) ==
+                healthy_used_peers.end()) {
+                healthy_used_peers.push_back(pid);
+            }
+        };
+
         for (size_t idx : shard_indices) {
             ShardMeta& sh = rec.shards[idx];
-            bool shard_ok = false;
+            std::vector<std::string> valid_holders;
+            std::vector<std::string> bad_holders;
 
-            if (sh.status != "CORRUPT") {
-                for (const auto& pid : sh.peers) {
-                    auto it = peer_map.find(pid);
-                    if (it != peer_map.end() && it->second.state == PeerHealth::ONLINE) {
-                        if (sh.status == "HEALTHY") {
-                            shard_ok = true;
-                            healthy_used_peers.push_back(pid);
-                            break;
-                        } else if (verify_peer_shard(it->second, sh)) {
-                            // Returning peer still has valid shard on disk
-                            sh.status = "HEALTHY";
-                            sh.peers = {pid};
-                            shard_ok = true;
-                            any_repaired = true;
-                            healthy_used_peers.push_back(pid);
-                            ss << "[In-Place Reconciled] " << sh.chunk_id
-                               << " verified SHA-256 on returning Peer " << pid << "\n";
-                            break;
-                        }
+            for (const auto& pid : sh.peers) {
+                auto it = peer_map.find(pid);
+                if (it == peer_map.end() || it->second.state != PeerHealth::ONLINE) {
+                    bad_holders.push_back(pid);
+                    continue;
+                }
+                if (sh.status == "HEALTHY") {
+                    valid_holders.push_back(pid);
+                } else {
+                    if (verify_peer_shard(it->second, sh)) {
+                        valid_holders.push_back(pid);
+                    } else {
+                        bad_holders.push_back(pid);
                     }
                 }
             }
 
-            if (shard_ok) {
-                surviving_indices.push_back(idx);
-            } else {
+            if (valid_holders.empty()) {
                 if (sh.status == "HEALTHY") sh.status = "UNAVAILABLE";
                 missing_indices.push_back(idx);
+            } else {
+                surviving_indices.push_back(idx);
+                for (const auto& vp : valid_holders) push_used_unique(vp);
+
+                if (sh.status != "CORRUPT" && bad_holders.empty()) {
+                    if (sh.status != "HEALTHY") {
+                        sh.status = "HEALTHY";
+                        sh.peers = valid_holders;
+                        any_repaired = true;
+                        ss << "[In-Place Reconciled] " << sh.chunk_id
+                           << " verified SHA-256 on returning Peer " << valid_holders.front() << "\n";
+                    }
+                } else {
+                    replica_heal_list.push_back({idx, valid_holders, bad_holders});
+                }
             }
         }
 
-        if (missing_indices.empty()) continue;
+        if (missing_indices.empty() && replica_heal_list.empty()) continue;
 
+        // Pick an eligible target peer not holding another shard in this stripe
+        auto pick_target_peer = [&]() -> std::pair<bool, PeerInfo> {
+            for (const auto& candidate : online_peers) {
+                if (candidate.workload.is_busy()) continue;
+                if (std::find(healthy_used_peers.begin(), healthy_used_peers.end(), candidate.id) ==
+                    healthy_used_peers.end()) {
+                    return {true, candidate};
+                }
+            }
+            for (const auto& candidate : online_peers) {
+                if (std::find(healthy_used_peers.begin(), healthy_used_peers.end(), candidate.id) ==
+                    healthy_used_peers.end()) {
+                    return {true, candidate};
+                }
+            }
+            return {false, PeerInfo{}};
+        };
+
+        // Pass 1 (Highest Priority): Restore completely missing shards first (HRERA Step 3 NO -> Step 5 -> Step 7 RS Decode)
         for (size_t m_idx : missing_indices) {
             ShardMeta& missing_shard = rec.shards[m_idx];
 
-            // Step 3 & 4: Check if an alternate online replica peer holds this shard
+            // Safety check in case a healthy replica on another peer exists
             bool restored_via_replica = false;
             std::vector<PeerInfo> healthy_replicas;
             for (const auto& pid : missing_shard.peers) {
@@ -828,24 +922,6 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
                     healthy_replicas.push_back(it->second);
                 }
             }
-
-            // Pick a target peer that doesn't already hold a shard of this stripe
-            auto pick_target_peer = [&]() -> std::pair<bool, PeerInfo> {
-                for (const auto& candidate : online_peers) {
-                    if (candidate.workload.is_busy()) continue;
-                    if (std::find(healthy_used_peers.begin(), healthy_used_peers.end(), candidate.id) ==
-                        healthy_used_peers.end()) {
-                        return {true, candidate};
-                    }
-                }
-                for (const auto& candidate : online_peers) {
-                    if (std::find(healthy_used_peers.begin(), healthy_used_peers.end(), candidate.id) ==
-                        healthy_used_peers.end()) {
-                        return {true, candidate};
-                    }
-                }
-                return {false, PeerInfo{}};
-            };
 
             if (!healthy_replicas.empty()) {
                 auto [found_repl, repl_peer] = pick_target_peer();
@@ -867,18 +943,24 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
                         if (client.request(req, {}, resp, pl) == proto::RecvStatus::OK &&
                             resp["type"].as_string() == proto::COPY_SHARD_ACK &&
                             resp["status"].as_string() == "OK") {
-                            missing_shard.peers = {repl_peer.id};
+                            missing_shard.peers.clear();
+                            for (const auto& hr : healthy_replicas) missing_shard.peers.push_back(hr.id);
+                            if (std::find(missing_shard.peers.begin(), missing_shard.peers.end(), repl_peer.id) ==
+                                missing_shard.peers.end()) {
+                                missing_shard.peers.push_back(repl_peer.id);
+                            }
                             missing_shard.status = "HEALTHY";
-                            healthy_used_peers.push_back(repl_peer.id);
+                            push_used_unique(repl_peer.id);
                             surviving_indices.push_back(m_idx);
                             any_repaired = true;
                             restored_via_replica = true;
-                            ss << "[Replica Copy Repair] " << missing_shard.chunk_id
+                            ss << "[HRERA Replica Copy] " << missing_shard.chunk_id
                                << " fetched from alternate Peer " << alt.id
                                << " -> Peer " << repl_peer.id << " (SHA-256 verified)\n";
                             json::Json d = json::Json::object();
                             d["file_id"] = file_id;
                             d["shard_id"] = missing_shard.chunk_id;
+                            d["source_peer"] = alt.id;
                             d["target_peer"] = repl_peer.id;
                             events_.log_event("REPAIR_REPLICA_OK", "shard repaired from alternate replica", d);
                         }
@@ -902,23 +984,18 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
                     json::Json sources = json::Json::array();
                     for (size_t s_idx : surviving_indices) {
                         const auto& surv_shard = rec.shards[s_idx];
-                        std::string src_pid;
                         for (const auto& sp : surv_shard.peers) {
                             auto it = peer_map.find(sp);
-                            if (it != peer_map.end() && it->second.state == PeerHealth::ONLINE) {
-                                src_pid = sp;
-                                break;
-                            }
+                            if (it == peer_map.end() || it->second.state != PeerHealth::ONLINE) continue;
+                            const auto& p_info = it->second;
+                            json::Json src = json::Json::object();
+                            src["peer_id"] = p_info.id;
+                            src["address"] = p_info.address;
+                            src["port"] = static_cast<long long>(p_info.port);
+                            src["shard_id"] = surv_shard.chunk_id;
+                            src["sha256"] = surv_shard.sha256;
+                            sources.push_back(src);
                         }
-                        if (src_pid.empty()) continue;
-                        const auto& p_info = peer_map[src_pid];
-                        json::Json src = json::Json::object();
-                        src["peer_id"] = p_info.id;
-                        src["address"] = p_info.address;
-                        src["port"] = static_cast<long long>(p_info.port);
-                        src["shard_id"] = surv_shard.chunk_id;
-                        src["sha256"] = surv_shard.sha256;
-                        sources.push_back(src);
                     }
                     req["sources"] = sources;
 
@@ -931,10 +1008,10 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
                             resp["status"].as_string() == "OK") {
                             missing_shard.peers = {repl_peer.id};
                             missing_shard.status = "HEALTHY";
-                            healthy_used_peers.push_back(repl_peer.id);
+                            push_used_unique(repl_peer.id);
                             surviving_indices.push_back(m_idx);
                             any_repaired = true;
-                            ss << "[Peer-to-Peer Repair] " << missing_shard.chunk_id
+                            ss << "[HRERA P2P RS Repair] " << missing_shard.chunk_id
                                << " restored onto replacement Peer " << repl_peer.id
                                << " via direct RS(" << (need_k + total_m) << "," << need_k << ") reconstruction\n";
                             json::Json d = json::Json::object();
@@ -985,7 +1062,7 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
                                 store_resp["type"].as_string() == proto::STORE_ACK) {
                                 missing_shard.peers = {repl_peer.id};
                                 missing_shard.status = "HEALTHY";
-                                healthy_used_peers.push_back(repl_peer.id);
+                                push_used_unique(repl_peer.id);
                                 surviving_indices.push_back(m_idx);
                                 any_repaired = true;
                                 ss << "[Central-Assisted Repair] " << missing_shard.chunk_id
@@ -1002,6 +1079,75 @@ bool CoordinatorService::repair_file(const std::string& file_id, std::string& re
                << (insufficient_surviving
                        ? " (fewer than " + std::to_string(need_k) + " valid shards; waiting with backoff)\n"
                        : " (waiting for an eligible healthy replacement peer)\n");
+        }
+
+        // Pass 2 (HRERA Step 3 YES -> Step 4): Shards that still have a verified alternate replica
+        // while a copy went offline or became corrupt. Restore replica onto a disjoint peer (or heal
+        // corrupt online peer in-place), otherwise prune dead holder while preserving healthy copy.
+        for (const auto& rd : replica_heal_list) {
+            ShardMeta& sh = rec.shards[rd.idx];
+            const auto alt_it = peer_map.find(rd.valid_holders.front());
+            if (alt_it == peer_map.end()) continue;
+            const PeerInfo& alt = alt_it->second;
+
+            auto [found_target, target_peer] = pick_target_peer();
+            if (!found_target && sh.status == "CORRUPT") {
+                for (const auto& bp : rd.bad_holders) {
+                    auto bit = peer_map.find(bp);
+                    if (bit != peer_map.end() && bit->second.state == PeerHealth::ONLINE) {
+                        found_target = true;
+                        target_peer = bit->second;
+                        break;
+                    }
+                }
+            }
+
+            bool copied = false;
+            if (found_target) {
+                json::Json req = json::Json::object();
+                req["type"] = proto::COPY_SHARD;
+                req["target_shard_id"] = sh.chunk_id;
+                req["target_shard_size"] = static_cast<long long>(sh.size);
+                req["expected_sha256"] = sh.sha256;
+                req["source_address"] = alt.address;
+                req["source_port"] = static_cast<long long>(alt.port);
+                req["source_shard_id"] = sh.chunk_id;
+
+                TCPClient client(5000, 10000);
+                if (client.connect_to(target_peer.address, target_peer.port)) {
+                    json::Json resp;
+                    std::vector<uint8_t> pl;
+                    if (client.request(req, {}, resp, pl) == proto::RecvStatus::OK &&
+                        resp["type"].as_string() == proto::COPY_SHARD_ACK &&
+                        resp["status"].as_string() == "OK") {
+                        sh.peers = rd.valid_holders;
+                        if (std::find(sh.peers.begin(), sh.peers.end(), target_peer.id) == sh.peers.end()) {
+                            sh.peers.push_back(target_peer.id);
+                        }
+                        sh.status = "HEALTHY";
+                        push_used_unique(target_peer.id);
+                        any_repaired = true;
+                        copied = true;
+                        ss << "[HRERA Replica Copy] " << sh.chunk_id
+                           << " restored from alternate Peer " << alt.id
+                           << " -> Peer " << target_peer.id << " (SHA-256 verified)\n";
+                        json::Json d = json::Json::object();
+                        d["file_id"] = file_id;
+                        d["shard_id"] = sh.chunk_id;
+                        d["source_peer"] = alt.id;
+                        d["target_peer"] = target_peer.id;
+                        events_.log_event("REPAIR_REPLICA_OK", "shard replica restored from alternate peer", d);
+                    }
+                }
+            }
+
+            if (!copied) {
+                sh.peers = rd.valid_holders;
+                sh.status = "HEALTHY";
+                any_repaired = true;
+                ss << "[Replica Pruned] " << sh.chunk_id
+                   << " offline holder removed; healthy verified copy retained on Peer " << alt.id << "\n";
+            }
         }
     }
 

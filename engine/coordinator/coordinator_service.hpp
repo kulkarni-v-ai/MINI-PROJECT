@@ -41,7 +41,9 @@ public:
                        uint16_t http_port = 0,
                        std::string auth_token = "rfe-demo-token",
                        bool auto_recover = true,
-                       bool require_auth = true);
+                       bool require_auth = true,
+                       bool adaptive_replicas = true,
+                       size_t hot_replica_count = 1);
     ~CoordinatorService();
 
     bool start();
@@ -65,6 +67,8 @@ public:
     uint32_t rs_k() const { return rs_k_; }
     uint32_t rs_m() const { return rs_m_; }
     bool require_auth() const { return require_auth_; }
+    bool adaptive_replicas() const { return adaptive_replicas_; }
+    size_t hot_replica_count() const { return hot_replica_count_; }
 
     // Execute Chunking -> SHA-256 -> RS Encoding -> Dynamic Placement -> Peer Push
     bool process_uploaded_file(const std::string& file_id, FileRecord& rec_out);
@@ -93,6 +97,8 @@ private:
     uint16_t http_port_;
     bool auto_recover_;
     bool require_auth_;
+    bool adaptive_replicas_;
+    size_t hot_replica_count_;
 
     PeerRegistry registry_;
     CatalogManager catalog_{"metadata", "storage"};

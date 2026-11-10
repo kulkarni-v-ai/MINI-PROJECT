@@ -9,6 +9,8 @@
   "auto_recover": true,
   "rs_k": 2,
   "rs_m": 1,
+  "adaptive_replicas": true,
+  "hot_replica_count": 1,
   "chunk_size": 65536,
   "replication_factor": 2,
   "peers": [

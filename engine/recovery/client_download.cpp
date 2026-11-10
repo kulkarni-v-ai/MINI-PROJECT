@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -293,11 +294,30 @@ DownloadResult ClientDownload::download(const std::string& file_id,
     fs::remove_all(local_shards_dir, ec);
     fs::create_directories(local_shards_dir, ec);
 
-    // Group shards by stripe
-    std::map<std::string, std::vector<ShardMeta>> stripes;
+    // MGFRA: Group shards by stripe ordered numerically by minimum sequence number
+    struct StripeGroup {
+        std::string stripe_id;
+        uint64_t min_seq = std::numeric_limits<uint64_t>::max();
+        std::vector<ShardMeta> shards;
+    };
+    std::map<std::string, size_t> stripe_idx_map;
+    std::vector<StripeGroup> stripes;
     for (const auto& sh : rec.shards) {
-        stripes[sh.stripe_id].push_back(sh);
+        auto it = stripe_idx_map.find(sh.stripe_id);
+        if (it == stripe_idx_map.end()) {
+            stripe_idx_map[sh.stripe_id] = stripes.size();
+            stripes.push_back({sh.stripe_id, sh.sequence, {sh}});
+        } else {
+            auto& sg = stripes[it->second];
+            sg.min_seq = std::min(sg.min_seq, sh.sequence);
+            sg.shards.push_back(sh);
+        }
     }
+    std::sort(stripes.begin(), stripes.end(),
+              [](const StripeGroup& a, const StripeGroup& b) {
+                  if (a.min_seq != b.min_seq) return a.min_seq < b.min_seq;
+                  return a.stripe_id < b.stripe_id;
+              });
 
     if (stripes.empty()) {
         res.message = "manifest contains no distributed stripes (check cluster peers)";
@@ -306,9 +326,9 @@ DownloadResult ClientDownload::download(const std::string& file_id,
 
     size_t total_retrieved = 0;
 
-    for (auto& kv : stripes) {
-        const std::string& stripe_id = kv.first;
-        auto stripe_shards = kv.second;
+    for (auto& sg : stripes) {
+        const std::string& stripe_id = sg.stripe_id;
+        auto stripe_shards = sg.shards;
 
         // Try HEALTHY shards on ONLINE peers first
         auto shard_rank = [&](const ShardMeta& sm) -> int {
